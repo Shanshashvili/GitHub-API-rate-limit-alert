@@ -1,0 +1,235 @@
+name: GitHub API Rate Limit Alert
+run-name: GitHub API Rate Monitor for Runner Apps
+
+on:
+  schedule:
+    - cron: "0 9,17 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      app_matrix: ${{ steps.set-matrix.outputs.app_matrix }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get GitHub PAT from Azure Key Vault
+        run: |
+          PAT=$(az keyvault secret show \
+            --name "github-access-token" \
+            --vault-name "${{ vars.AZURE_KEYVAULT }}" \
+            --query value -o tsv)
+          echo "::add-mask::$PAT"
+          echo "GITHUB_PAT=$PAT" >> $GITHUB_ENV
+
+      - name: Get GitHub Apps with 'Runner' and match secrets
+        id: set-matrix
+        run: |
+          # Save runner app details to file
+          curl -s -H "Authorization: Bearer $GITHUB_PAT" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/orgs/${{ github.repository_owner }}/installations?per_page=100" \
+          | jq '[.installations[] | select(.app_slug | test("runner"; "i")) | select(.suspended_by == null) | {app_slug, app_id, installation_id: .id}]' > runner_apps.json
+
+          echo "==============================="
+          echo "Detected Apps:"
+          cat runner_apps.json
+
+          echo "==============================="
+
+          # Get list of runner secrets
+          az keyvault secret list \
+            --vault-name "${{ vars.AZURE_KEYVAULT }}" \
+            --query "[].name" -o tsv > all_secrets.txt
+
+          grep -i "gh-privatekey" all_secrets.txt > secret_names.txt
+
+          echo "Filtered secrets containing 'gh-privatekey':"
+          cat secret_names.txt
+
+          echo "==============================="
+
+          # Match secrets to each app
+          matched_apps=()
+          while IFS= read -r row; do
+            slug=$(echo "$row" | jq -r .app_slug)
+            id=$(echo "$row" | jq -r .app_id)
+            inst=$(echo "$row" | jq -r .installation_id)
+
+            core=${slug#oboba-}
+            core=${core%-runners}
+            IFS='-' read -r -a parts <<< "$core"
+
+            secret=""
+
+            # data-metadata → gh-privateKey-dataMetadataRunner
+            if [[ ${#parts[@]} -gt 1 ]]; then
+              candidate="gh-privateKey-${parts[0]}${parts[1]^}Runner"
+              if grep -qi "^$candidate$" secret_names.txt; then
+                secret="$candidate"
+              fi
+            fi
+
+            # data → gh-privateKey-dataRunner
+            if [[ -z "$secret" && ${#parts[@]} -ge 1 ]]; then
+              candidate="gh-privateKey-${parts[0]}Runner"
+              if grep -qi "^$candidate$" secret_names.txt; then
+                secret="$candidate"
+              fi
+            fi
+
+            # Special (like AM) → use second part
+            if [[ -z "$secret" && ${#parts[@]} -eq 2 ]]; then
+              candidate="gh-privateKey-${parts[1]}Runner"
+              if grep -qi "^$candidate$" secret_names.txt; then
+                secret="$candidate"
+              fi
+            fi
+
+            matched_apps+=("{\"name\":\"$slug\",\"app_id\":$id,\"installation_id\":$inst,\"secret\":\"$secret\"}")
+          done < <(jq -c '.[]' runner_apps.json)
+
+          echo "${matched_apps[@]}" | jq -s '.' > final_matrix.json
+
+          echo "Final Matrix (name, app_id, installation_id, secret):"
+          cat final_matrix.json  # Debug
+
+          echo "app_matrix=$(jq -c '.' final_matrix.json)" >> $GITHUB_OUTPUT
+          echo "===================================="
+
+  check-rate-limit:
+    needs: build-matrix
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        app: ${{ fromJson(needs.build-matrix.outputs.app_matrix) }}
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Private Key from Key Vault
+        run: |
+          PRIVATE_KEY=$(az keyvault secret show \
+            --name "${{ matrix.app.secret }}" \
+            --vault-name "${{ vars.AZURE_KEYVAULT }}" \
+            --query value -o tsv)
+          echo "$PRIVATE_KEY" > private-key.pem
+          chmod 600 private-key.pem
+
+      - name: Generate JWT and Get Access Token
+        id: auth
+        run: |
+          now=$(date +%s)
+          exp=$((now + 600))
+          header='{"alg":"RS256","typ":"JWT"}'
+          payload="{\"iat\":$now,\"exp\":$exp,\"iss\":${{ matrix.app.app_id }}}"
+
+          header_b64=$(echo "$header" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          payload_b64=$(echo "$payload" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          jwt="$header_b64.$payload_b64"
+
+          signature=$(echo -n "$jwt" | openssl dgst -sha256 -sign private-key.pem | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          token="$jwt.$signature"
+
+          echo "::add-mask::$token"
+
+          access_token=$(curl -s -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/app/installations/${{ matrix.app.installation_id }}/access_tokens | jq -r .token)
+
+          echo "ACCESS_TOKEN=$access_token" >> $GITHUB_ENV
+
+      - name: Check Rate Limit and Prepare Email Trigger
+        run: |
+          echo "Checking rate limit for '${{ matrix.app.name }}'..."
+
+          # Call GitHub API, save JSON, and capture status
+          HTTP_STATUS=$(curl -s -w "%{http_code}" -o rate.json \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/rate_limit)
+
+          echo "=============== rate.json ==============="
+          cat rate.json
+          echo "========================================="
+
+          remaining=$(jq .rate.remaining rate.json)
+          limit=$(jq .rate.limit rate.json)
+
+          echo "HTTP_STATUS=$HTTP_STATUS"
+          echo "RATE_REMAINING=$remaining"
+          echo "RATE_LIMIT=$limit"
+
+          echo "RATE_REMAINING=$remaining" >> $GITHUB_ENV
+          echo "RATE_LIMIT=$limit" >> $GITHUB_ENV
+          echo "HTTP_STATUS=$HTTP_STATUS" >> $GITHUB_ENV
+
+          # Flag to decide if send email
+          if [[ "$HTTP_STATUS" -eq 403 || "$HTTP_STATUS" -eq 429 || "$remaining" -lt 500 ]]; then
+            echo "ALERT_EMAIL=true" >> $GITHUB_ENV
+            echo "Email alert will be triggered"
+          else
+            echo "ALERT_EMAIL=false" >> $GITHUB_ENV
+            echo "No alert needed"
+          fi
+
+          echo "========================================="
+
+      - name: Send Email Alert if Needed
+        if: env.ALERT_EMAIL == 'true'
+        run: |
+          echo "Sending email alert for '${{ matrix.app.name }}'..."
+
+          graphApiToken=$(az account get-access-token \
+            --resource https://graph.microsoft.com \
+            --query accessToken -o tsv)
+
+          if [[ "$HTTP_STATUS" -eq 429 ]]; then
+            SUBJECT="GitHub API Warning: 429 - Too Many Requests for ${{ matrix.app.name }}"
+            BODY="Hello Team,\n\nGitHub API Warning: 429 - Too Many Requests\nThe GitHub App '${{ matrix.app.name }}' is being throttled due to high request volume.\nYou may be hitting secondary rate limits."
+
+          elif [[ "$HTTP_STATUS" -eq 403 ]]; then
+            SUBJECT="GitHub API Error: 403 - Rate Limit Exceeded for ${{ matrix.app.name }}"
+            BODY="Hi Team,\n\nGitHub API Error: 403 - Rate Limit Exceeded\nThe GitHub App '${{ matrix.app.name }}' has exhausted its rate limit.\nNo further API requests can be made until the rate limit resets.\n\nPlease investigate the API usage and apply throttling or caching if needed."
+
+          else
+            SUBJECT="GitHub API Rate Limit Low for ${{ matrix.app.name }}"
+            BODY="Hi Team,\n\nGitHub API usage is high for GitHub App '${{ matrix.app.name }}'.\nRemaining: $RATE_REMAINING / $RATE_LIMIT\n\nPlease monitor usage and optimize where possible to prevent disruption."
+          fi
+
+          curl -X POST https://graph.microsoft.com/v1.0/users/sender@email.com/sendMail \
+            -H "Authorization: Bearer $graphApiToken" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "message": {
+                "subject": "'"$SUBJECT"'",
+                "body": {
+                  "contentType": "Text",
+                  "content": "'"$BODY"'"
+                },
+                "toRecipients": [
+                  {
+                    "emailAddress": {
+                      "address": "recipient@email.com"
+                    }
+                  }
+                ]
+              }
+            }'
