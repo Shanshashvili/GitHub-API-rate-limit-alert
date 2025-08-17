@@ -1,0 +1,50 @@
+name: GitHub Rate Limit Alert (Native SMTP)
+
+on:
+#  schedule:
+#    - cron: "*/30 * * * *"  # every 30 minutes
+  workflow_dispatch:
+
+jobs:
+  check-rate-limit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.RSA_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check GitHub Rate Limit
+        id: rate_limit
+        run: |
+          curl -s -H "Authorization: Bearer ${{ steps.generate_token.outputs.token }}" \
+               -H "Accept: application/vnd.github+json" \
+               -H "X-GitHub-Api-Version: 2022-11-28" \
+               https://api.github.com/rate_limit > rate.json
+
+          REMAINING=$(jq '.rate.remaining' rate.json)
+          echo "Remaining: $REMAINING"
+          echo "rate_remaining=$REMAINING" >> $GITHUB_OUTPUT
+
+      - name: Send Email if Low
+        if: steps.rate_limit.outputs.rate_remaining != '' && steps.rate_limit.outputs.rate_remaining <= 500
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.office365.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "GitHub Rate Limit Alert"
+          to: <your-team@example.com>
+          from: GitHub Monitor <your-sender@example.com>
+          body: |
+            ⚠️ Warning: GitHub API rate limit is running low.
+
+            Remaining calls: ${{ steps.rate_limit.outputs.rate_remaining }}
+
+            Please check workflows or integrations that might be consuming it.
+          priority: high
